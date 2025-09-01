@@ -26,33 +26,41 @@ public class GetFilePassthrough
 
         try
         {
-            // Get the OneLake DFS file URL from environment variables
+            // 環境変数から OneLake のファイル URL を取得
             var oneLakeFileUrl = Environment.GetEnvironmentVariable("ONELAKE_DFS_FILE_URL");
-            
+            _logger.LogInformation("ONELAKE_DFS_FILE_URL = {Url}", oneLakeFileUrl);
+
             if (string.IsNullOrEmpty(oneLakeFileUrl))
             {
                 _logger.LogError("ONELAKE_DFS_FILE_URL environment variable is not set.");
                 return req.CreateResponse(HttpStatusCode.InternalServerError);
             }
 
-            // Create DataLakeFileClient with injected DefaultAzureCredential
-            var dataLakeFileClient = new DataLakeFileClient(new Uri(oneLakeFileUrl), _credential);
+            // OneLake が要求する API バージョンを明示（2023-11-03）
+            var dlOptions = new DataLakeClientOptions(DataLakeClientOptions.ServiceVersion.V2023_11_03);
 
-            // Check if file exists
-            var existsResponse = await dataLakeFileClient.ExistsAsync();
+            // まずは Azure CLI と同じ資格情報で動かしてみる（動作確認用）
+            // デモで問題なければ _credential に差し替え可能
+            var credential = new AzureCliCredential();
+
+            // FileClient を生成
+            var fileClient = new DataLakeFileClient(new Uri(oneLakeFileUrl), credential, dlOptions);
+
+            // ファイル存在確認（任意、なくても Read 側で 404 を拾える）
+            var existsResponse = await fileClient.ExistsAsync();
             if (!existsResponse.Value)
             {
                 _logger.LogWarning("File not found at URL: {FileUrl}", oneLakeFileUrl);
                 return req.CreateResponse(HttpStatusCode.NotFound);
             }
 
-            // Download the file content
-            var downloadResponse = await dataLakeFileClient.ReadAsync();
+            // ファイルをダウンロード
+            var downloadResponse = await fileClient.ReadAsync();
 
             var resp = req.CreateResponse(HttpStatusCode.OK);
             resp.Headers.Add("Content-Type", "text/csv; charset=utf-8");
             await downloadResponse.Value.Content.CopyToAsync(resp.Body);
-            
+
             _logger.LogInformation("Successfully retrieved CSV file from OneLake.");
             return resp;
         }
