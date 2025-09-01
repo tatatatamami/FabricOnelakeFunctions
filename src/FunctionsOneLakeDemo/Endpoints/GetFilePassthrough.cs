@@ -1,8 +1,7 @@
 using Azure.Identity;
 using Azure.Storage.Files.DataLake;
-using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.Extensions.Logging;
 using System.Net;
 
@@ -11,15 +10,17 @@ namespace function_onelake.Endpoints;
 public class GetFilePassthrough
 {
     private readonly ILogger<GetFilePassthrough> _logger;
+    private readonly DefaultAzureCredential _credential;
 
-    public GetFilePassthrough(ILogger<GetFilePassthrough> logger)
+    public GetFilePassthrough(ILogger<GetFilePassthrough> logger, DefaultAzureCredential credential)
     {
         _logger = logger;
+        _credential = credential;
     }
 
     [Function("GetFilePassthrough")]
-    public async Task<IActionResult> Run(
-        [HttpTrigger(AuthorizationLevel.Function, "get", Route = "files/raw")] HttpRequest req)
+    public async Task<HttpResponseData> Run(
+        [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "files/raw")] HttpRequestData req)
     {
         _logger.LogInformation("Processing request for OneLake CSV file.");
 
@@ -31,48 +32,49 @@ public class GetFilePassthrough
             if (string.IsNullOrEmpty(oneLakeFileUrl))
             {
                 _logger.LogError("ONELAKE_DFS_FILE_URL environment variable is not set.");
-                return new StatusCodeResult((int)HttpStatusCode.InternalServerError);
+                return req.CreateResponse(HttpStatusCode.InternalServerError);
             }
 
-            // Create DataLakeFileClient with DefaultAzureCredential
-            var dataLakeFileClient = new DataLakeFileClient(new Uri(oneLakeFileUrl), new DefaultAzureCredential());
+            // Create DataLakeFileClient with injected DefaultAzureCredential
+            var dataLakeFileClient = new DataLakeFileClient(new Uri(oneLakeFileUrl), _credential);
 
             // Check if file exists
             var existsResponse = await dataLakeFileClient.ExistsAsync();
             if (!existsResponse.Value)
             {
                 _logger.LogWarning("File not found at URL: {FileUrl}", oneLakeFileUrl);
-                return new StatusCodeResult((int)HttpStatusCode.NotFound);
+                return req.CreateResponse(HttpStatusCode.NotFound);
             }
 
             // Download the file content
             var downloadResponse = await dataLakeFileClient.ReadAsync();
-            
-            // Set the content type for CSV
-            var result = new FileStreamResult(downloadResponse.Value.Content, "text/csv; charset=utf-8");
+
+            var resp = req.CreateResponse(HttpStatusCode.OK);
+            resp.Headers.Add("Content-Type", "text/csv; charset=utf-8");
+            await downloadResponse.Value.Content.CopyToAsync(resp.Body);
             
             _logger.LogInformation("Successfully retrieved CSV file from OneLake.");
-            return result;
+            return resp;
         }
         catch (Azure.RequestFailedException ex) when (ex.Status == 403)
         {
             _logger.LogError(ex, "Access forbidden when trying to access OneLake file.");
-            return new StatusCodeResult((int)HttpStatusCode.Forbidden);
+            return req.CreateResponse(HttpStatusCode.Forbidden);
         }
         catch (Azure.RequestFailedException ex) when (ex.Status == 404)
         {
             _logger.LogError(ex, "File not found in OneLake.");
-            return new StatusCodeResult((int)HttpStatusCode.NotFound);
+            return req.CreateResponse(HttpStatusCode.NotFound);
         }
         catch (Azure.RequestFailedException ex)
         {
             _logger.LogError(ex, "Azure request failed with status {Status}: {Message}", ex.Status, ex.Message);
-            return new StatusCodeResult((int)HttpStatusCode.InternalServerError);
+            return req.CreateResponse(HttpStatusCode.InternalServerError);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Unexpected error occurred while processing OneLake file request.");
-            return new StatusCodeResult((int)HttpStatusCode.InternalServerError);
+            return req.CreateResponse(HttpStatusCode.InternalServerError);
         }
     }
 }
