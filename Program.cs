@@ -11,6 +11,7 @@ builder.ConfigureFunctionsWebApplication();
 builder.Services
     .AddApplicationInsightsTelemetryWorkerService()
     .ConfigureFunctionsApplicationInsights()
+    .AddHttpClient()
     .AddSingleton<DefaultAzureCredential>();
 
 builder.Build().Run();
