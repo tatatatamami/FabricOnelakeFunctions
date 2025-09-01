@@ -1,8 +1,11 @@
 using System.Globalization;
+using System.Net;
+using Azure.Identity;
+using Azure.Storage.Files.DataLake;
 using CsvHelper;
-using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Mvc;
+using CsvHelper.Configuration;
 using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.Extensions.Logging;
 using function_onelake.Models;
 
@@ -11,110 +14,122 @@ namespace function_onelake.Endpoints;
 public class GetEmployeesFiltered
 {
     private readonly ILogger<GetEmployeesFiltered> _logger;
-    private readonly HttpClient _httpClient;
     private const int MaxItems = 50;
 
-    public GetEmployeesFiltered(ILogger<GetEmployeesFiltered> logger, HttpClient httpClient)
+    public GetEmployeesFiltered(ILogger<GetEmployeesFiltered> logger)
     {
         _logger = logger;
-        _httpClient = httpClient;
     }
 
     [Function("GetEmployeesFiltered")]
-    public async Task<IActionResult> Run(
-        [HttpTrigger(AuthorizationLevel.Function, "get", Route = "employees")] HttpRequest req)
+    public async Task<HttpResponseData> Run(
+        [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "employees")] HttpRequestData req)
     {
         try
         {
             _logger.LogInformation("Processing GET /api/employees request");
 
-            // Get the department filter from query parameters
-            string? department = req.Query["department"];
-            
+            // クエリ: department 必須
+            var query = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
+            var department = query.Get("department");
             if (string.IsNullOrWhiteSpace(department))
             {
-                return new BadRequestObjectResult(new { error = "Department parameter is required" });
+                var bad = req.CreateResponse(HttpStatusCode.BadRequest);
+                await bad.WriteStringAsync("Query parameter 'department' is required.");
+                return bad;
             }
 
-            // Get the CSV file URL from environment variables
-            string? csvUrl = Environment.GetEnvironmentVariable("ONELAKE_DFS_FILE_URL");
+            // OneLake CSV の URL
+            var csvUrl = Environment.GetEnvironmentVariable("ONELAKE_DFS_FILE_URL");
             if (string.IsNullOrWhiteSpace(csvUrl))
             {
-                _logger.LogError("ONELAKE_DFS_FILE_URL environment variable is not set");
-                return new StatusCodeResult(500);
+                _logger.LogError("ONELAKE_DFS_FILE_URL environment variable is not set.");
+                return req.CreateResponse(HttpStatusCode.InternalServerError);
             }
 
-            // Read and parse CSV data
-            List<Employee> allEmployees;
-            try
+            // OneLake は 2023-11-03 の API バージョンを使用
+            var options = new DataLakeClientOptions(DataLakeClientOptions.ServiceVersion.V2023_11_03);
+
+            // まずは Azure CLI 資格情報で動作確認（必要なら DefaultAzureCredential に切替）
+            var credential = new AzureCliCredential();
+
+            var fileClient = new DataLakeFileClient(new Uri(csvUrl), credential, options);
+
+            // CSV をストリームで読み込み
+            var download = await fileClient.ReadAsync();
+            using var stream = download.Value.Content;
+            using var reader = new StreamReader(stream);
+            using var csv = new CsvReader(reader, new CsvConfiguration(CultureInfo.InvariantCulture)
             {
-                allEmployees = await ReadCsvDataAsync(csvUrl);
-            }
-            catch (HttpRequestException ex)
+                HasHeaderRecord = true,
+                TrimOptions = TrimOptions.Trim,
+                DetectDelimiter = true,
+                BadDataFound = null
+            });
+
+            // 列名: id,name,age,department,salary を Employee にマップ
+            csv.Context.RegisterClassMap<EmployeeMap>();
+
+            // フィルタ（大文字小文字無視）
+            var deptLower = department.Trim().ToLowerInvariant();
+            var employees = new List<Employee>();
+            await foreach (var rec in csv.GetRecordsAsync<Employee>())
             {
-                _logger.LogError(ex, "Failed to fetch CSV data from URL: {CsvUrl}", csvUrl);
-                return new NotFoundObjectResult(new { error = "CSV file not found or inaccessible" });
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error parsing CSV data");
-                return new StatusCodeResult(500);
+                if ((rec.Department ?? "").Trim().ToLowerInvariant() == deptLower)
+                {
+                    employees.Add(rec);
+                }
             }
 
-            // Filter by department (case-insensitive)
-            var filteredEmployees = allEmployees
-                .Where(e => string.Equals(e.Department, department, StringComparison.OrdinalIgnoreCase))
-                .ToList();
-
-            if (!filteredEmployees.Any())
+            // レスポンス生成
+            if (employees.Count == 0)
             {
-                return new OkObjectResult(new EmployeeResponse
+                var okEmpty = req.CreateResponse(HttpStatusCode.OK);
+                await okEmpty.WriteAsJsonAsync(new EmployeeResponse
                 {
                     Total = 0,
                     Department = department,
                     AverageSalary = 0,
                     Items = new List<Employee>()
                 });
+                return okEmpty;
             }
 
-            // Calculate average salary
-            decimal averageSalary = filteredEmployees.Average(e => e.Salary);
+            var avg = Math.Round(employees.Average(e => e.Salary));
+            var items = employees.Take(MaxItems).ToList();
 
-            // Limit to max 50 items
-            var limitedEmployees = filteredEmployees.Take(MaxItems).ToList();
-
-            var response = new EmployeeResponse
+            var ok = req.CreateResponse(HttpStatusCode.OK);
+            await ok.WriteAsJsonAsync(new EmployeeResponse
             {
-                Total = filteredEmployees.Count,
+                Total = employees.Count,
                 Department = department,
-                AverageSalary = Math.Round(averageSalary, 0), // Round to nearest whole number
-                Items = limitedEmployees
-            };
-
-            return new OkObjectResult(response);
+                AverageSalary = avg,
+                Items = items
+            });
+            return ok;
+        }
+        catch (Azure.RequestFailedException ex) when (ex.Status == 404)
+        {
+            _logger.LogWarning(ex, "CSV file not found or inaccessible in OneLake.");
+            return req.CreateResponse(HttpStatusCode.NotFound);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Unexpected error in GetEmployeesFiltered");
-            return new StatusCodeResult(500);
+            _logger.LogError(ex, "Unexpected error in GetEmployeesFiltered.");
+            return req.CreateResponse(HttpStatusCode.InternalServerError);
         }
     }
 
-    private async Task<List<Employee>> ReadCsvDataAsync(string csvUrl)
+    // CsvHelper マッピング（CSVヘッダーに一致）
+    private sealed class EmployeeMap : ClassMap<Employee>
     {
-        var response = await _httpClient.GetAsync(csvUrl);
-        response.EnsureSuccessStatusCode();
-
-        using var stream = await response.Content.ReadAsStreamAsync();
-        using var reader = new StreamReader(stream);
-        using var csv = new CsvReader(reader, CultureInfo.InvariantCulture);
-
-        var employees = new List<Employee>();
-        await foreach (var record in csv.GetRecordsAsync<Employee>())
+        public EmployeeMap()
         {
-            employees.Add(record);
+            Map(m => m.Id).Name("id");
+            Map(m => m.Name).Name("name");
+            Map(m => m.Age).Name("age");
+            Map(m => m.Department).Name("department");
+            Map(m => m.Salary).Name("salary");
         }
-
-        return employees;
     }
 }
