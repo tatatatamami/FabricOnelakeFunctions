@@ -1,13 +1,15 @@
-using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Mvc;
-using Microsoft.Azure.Functions.Worker;
-using Microsoft.Extensions.Logging;
-using Microsoft.Data.SqlClient;
-using Azure.Identity;
-using Azure.Core;
+using System.Net;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using Azure.Core;
+using Azure.Identity;
+using Microsoft.AspNetCore.WebUtilities;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
+using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Logging;
 
-namespace FunctionsOneLakeDemo.Endpoints;
+namespace function_onelake.Endpoints;
 
 public class GetEmployeesBySql
 {
@@ -19,126 +21,155 @@ public class GetEmployeesBySql
     }
 
     [Function("GetEmployeesBySql")]
-    public async Task<IActionResult> Run(
-        [HttpTrigger(AuthorizationLevel.Function, "get", Route = "employees/sql")] HttpRequest req)
+    public async Task<HttpResponseData> Run(
+        [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "employees/sql")] HttpRequestData req)
     {
         _logger.LogInformation("Processing SQL employees aggregation request.");
 
+        // 1) 環境変数
+        var sqlEndpoint = Environment.GetEnvironmentVariable("SQL_ENDPOINT");
+        var sqlDatabase = Environment.GetEnvironmentVariable("SQL_DATABASE");
+
+        if (string.IsNullOrWhiteSpace(sqlEndpoint) || string.IsNullOrWhiteSpace(sqlDatabase))
+        {
+            var respBad = req.CreateResponse(HttpStatusCode.InternalServerError);
+            await respBad.WriteAsJsonAsync(new
+            {
+                error = "Database configuration missing. Please set SQL_ENDPOINT and SQL_DATABASE environment variables."
+            });
+            return respBad;
+        }
+
+        // 2) クエリ取得 (?department=IT など)
+        string? department = null;
+        var q = QueryHelpers.ParseQuery(req.Url.Query);
+        if (q.TryGetValue("department", out var depVals))
+        {
+            department = depVals.ToString();
+        }
+
         try
         {
-            // Get environment variables
-            var sqlEndpoint = Environment.GetEnvironmentVariable("SQL_ENDPOINT");
-            var sqlDatabase = Environment.GetEnvironmentVariable("SQL_DATABASE");
+            // 3) Entra ID トークン取得
+            //    まず Azure CLI の資格情報を使い、失敗した場合のみ DefaultAzureCredential にフォールバック
+            AccessToken token;
+            var scope = new TokenRequestContext(new[] { "https://database.windows.net/.default" });
 
-            if (string.IsNullOrEmpty(sqlEndpoint) || string.IsNullOrEmpty(sqlDatabase))
+            try
             {
-                _logger.LogError("SQL_ENDPOINT or SQL_DATABASE environment variables are not configured.");
-                return new BadRequestObjectResult(new { error = "Database configuration missing. Please configure SQL_ENDPOINT and SQL_DATABASE environment variables." });
+                var cli = new AzureCliCredential();
+                token = await cli.GetTokenAsync(scope, default);
+                _logger.LogInformation("Access token acquired via AzureCliCredential.");
+            }
+            catch (Exception cliEx)
+            {
+                _logger.LogWarning(cliEx, "AzureCliCredential failed. Falling back to DefaultAzureCredential.");
+                var @default = new DefaultAzureCredential();
+                token = await @default.GetTokenAsync(scope, default);
+                _logger.LogInformation("Access token acquired via DefaultAzureCredential.");
             }
 
-            // Get department query parameter
-            var department = req.Query["department"].ToString();
-
-            // Get Entra ID access token
-            var credential = new DefaultAzureCredential();
-            var tokenRequestContext = new TokenRequestContext(new[] { "https://database.windows.net/.default" });
-            var token = await credential.GetTokenAsync(tokenRequestContext);
-
-            // Build connection string
-            var connectionStringBuilder = new SqlConnectionStringBuilder
+            // 4) 接続文字列作成
+            var csb = new SqlConnectionStringBuilder
             {
-                DataSource = sqlEndpoint,
-                InitialCatalog = sqlDatabase,
+                DataSource = sqlEndpoint,     // 例: "<xxx>.datawarehouse.fabric.microsoft.com"
+                InitialCatalog = sqlDatabase, // 例: "fabricdemo"
                 Encrypt = true,
                 TrustServerCertificate = false,
-                ConnectTimeout = 30,
-                CommandTimeout = 30
+                ConnectTimeout = 30
             };
 
-            var connectionString = connectionStringBuilder.ConnectionString;
-
-            // Build SQL query
-            string sqlQuery;
-            List<SqlParameter> parameters = new List<SqlParameter>();
-
-            if (!string.IsNullOrEmpty(department))
+            using var conn = new SqlConnection(csb.ConnectionString)
             {
-                sqlQuery = @"
+                AccessToken = token.Token
+            };
+            await conn.OpenAsync();
+
+            // 5) SQL (集計は DB 側へプッシュダウン)
+            string sql;
+            var cmd = conn.CreateCommand();
+
+            if (!string.IsNullOrWhiteSpace(department))
+            {
+                sql = @"
                     SELECT 
-                        COUNT(*) as Total,
-                        AVG(CAST(salary AS FLOAT)) as AverageSalary
-                    FROM dbo.employees 
-                    WHERE department = @department";
-                parameters.Add(new SqlParameter("@department", department));
+                      COUNT(*) AS Total,
+                      AVG(CAST(salary AS FLOAT)) AS AverageSalary
+                    FROM dbo.sample_employees
+                    WHERE department = @department;";
+                cmd.Parameters.Add(new SqlParameter("@department", department));
             }
             else
             {
-                sqlQuery = @"
+                sql = @"
                     SELECT 
-                        COUNT(*) as Total,
-                        AVG(CAST(salary AS FLOAT)) as AverageSalary
-                    FROM dbo.employees";
+                      COUNT(*) AS Total,
+                      AVG(CAST(salary AS FLOAT)) AS AverageSalary
+                    FROM dbo.sample_employees;";
             }
 
-            // Execute query
-            using var connection = new SqlConnection(connectionString);
-            connection.AccessToken = token.Token;
+            cmd.CommandText = sql;
 
-            await connection.OpenAsync();
-
-            using var command = new SqlCommand(sqlQuery, connection);
-            foreach (var param in parameters)
-            {
-                command.Parameters.Add(param);
-            }
-
-            using var reader = await command.ExecuteReaderAsync();
+            using var reader = await cmd.ExecuteReaderAsync();
+            int total = 0;
+            int averageSalary = 0;
 
             if (await reader.ReadAsync())
             {
-                var result = new
+                total = reader.IsDBNull(0) ? 0 : reader.GetInt32(0);
+                if (!reader.IsDBNull(1))
                 {
-                    total = reader.GetInt32(0),  // First column: Total
-                    department = !string.IsNullOrEmpty(department) ? department : null,
-                    averageSalary = reader.IsDBNull(1) ? 0 : (int)Math.Round(reader.GetDouble(1))  // Second column: AverageSalary
-                };
-
-                // Remove null properties for cleaner JSON
-                var options = new JsonSerializerOptions
-                {
-                    DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
-                };
-
-                return new OkObjectResult(result);
+                    var avg = reader.GetDouble(1);
+                    averageSalary = (int)Math.Round(avg);
+                }
             }
-            else
+
+            // 6) 応答作成（null を削除）
+            var resp = req.CreateResponse(HttpStatusCode.OK);
+            resp.Headers.Add("Content-Type", "application/json; charset=utf-8");
+
+            var payload = new
             {
-                return new OkObjectResult(new { total = 0, department = department, averageSalary = 0 });
-            }
-        }
-        catch (SqlException sqlEx)
-        {
-            _logger.LogError(sqlEx, "SQL error occurred while querying employee data.");
-            return new ObjectResult(new { error = "Database connection failed. Please check the SQL endpoint configuration and ensure the database is accessible." })
-            {
-                StatusCode = 500
+                total,
+                department = string.IsNullOrWhiteSpace(department) ? null : department,
+                averageSalary
             };
-        }
-        catch (AuthenticationFailedException authEx)
-        {
-            _logger.LogError(authEx, "Authentication failed while connecting to database.");
-            return new ObjectResult(new { error = "Authentication failed. Please ensure Entra ID authentication is properly configured." })
+            var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions
             {
-                StatusCode = 500
-            };
+                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+            });
+            await resp.WriteStringAsync(json);
+            return resp;
+        }
+        catch (SqlException ex)
+        {
+            _logger.LogError(ex, "SQL error occurred while querying employee data.");
+            var resp = req.CreateResponse(HttpStatusCode.InternalServerError);
+            await resp.WriteAsJsonAsync(new
+            {
+                error = "Database connection failed. Please check the SQL endpoint configuration and ensure the database is accessible."
+            });
+            return resp;
+        }
+        catch (AuthenticationFailedException ex)
+        {
+            _logger.LogError(ex, "Authentication failed while connecting to database.");
+            var resp = req.CreateResponse(HttpStatusCode.InternalServerError);
+            await resp.WriteAsJsonAsync(new
+            {
+                error = "Authentication failed. Please ensure Entra ID authentication is properly configured."
+            });
+            return resp;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Unexpected error occurred while processing SQL employees request.");
-            return new ObjectResult(new { error = "An unexpected error occurred while processing the request." })
+            var resp = req.CreateResponse(HttpStatusCode.InternalServerError);
+            await resp.WriteAsJsonAsync(new
             {
-                StatusCode = 500
-            };
+                error = "An unexpected error occurred while processing the request."
+            });
+            return resp;
         }
     }
 }
